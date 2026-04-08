@@ -157,6 +157,28 @@ export class NetSuiteClient {
     return { items: allItems, totalResults, pagesFetched };
   }
 
+  async getRecordMetadata(recordType: string): Promise<unknown> {
+    const token = await this.authenticate();
+    const url = `${this.baseUrl}/services/rest/record/v1/metadata-catalog/${encodeURIComponent(recordType)}`;
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/schema+json",
+      },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(
+        `Metadata catalog request failed (${response.status}): ${errorText}`
+      );
+    }
+
+    return await response.json();
+  }
+
   async callRestlet(
     scriptId: string,
     deployId: string,

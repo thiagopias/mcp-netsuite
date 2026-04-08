@@ -5,3 +5,4 @@ dist/
 *.pem
 *.key
 .cursor/mcp.json
+secrets/
