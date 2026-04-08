@@ -904,14 +904,13 @@ server.tool(
         `t.trandate, ` +
         `BUILTIN.DF(t.status) AS statusName, ` +
         `t.status, ` +
-        `t.amount, ` +
         `t.foreigntotal, ` +
         `BUILTIN.DF(t.currency) AS currency, ` +
         `BUILTIN.DF(t.terms) AS paymentTerms, ` +
         `t.duedate, ` +
         `t.closedate, ` +
         `t.memo, ` +
-        `t.createdate, ` +
+        `t.lastmodifieddate, ` +
         `BUILTIN.DF(t.createdby) AS createdBy ` +
         `FROM Transaction t ` +
         `${whereClause} ` +
@@ -932,7 +931,7 @@ server.tool(
           `tl.quantity, ` +
           `tl.rate, ` +
           `tl.amount, ` +
-          `tl.description, ` +
+          `tl.memo AS description, ` +
           `tl.taxamount, ` +
           `BUILTIN.DF(tl.location) AS location ` +
           `FROM TransactionLine tl ` +
