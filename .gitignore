@@ -6,3 +6,4 @@ dist/
 *.key
 .cursor/mcp.json
 secrets/
+.claude.json
