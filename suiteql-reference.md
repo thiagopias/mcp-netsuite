@@ -111,6 +111,43 @@ ORDER BY sn.date DESC
 FETCH FIRST 50 ROWS ONLY
 ```
 
+### `CustomField`
+All custom field definitions live in this single table. Filter by `fieldtype` to narrow to the category you need.
+
+| fieldtype | Script ID prefix | Applies to |
+|-----------|-----------------|------------|
+| `BODY` | `custbody_` | Transaction header (SO, Invoice, RMA, etc.) |
+| `COLUMN` | `custcol_` | Transaction lines |
+| `ENTITY` | `custentity_` | Customer, Vendor, Employee, Contact |
+| `ITEM` | `custitem_` | Inventory items, service items, etc. |
+| `RECORD` | `custrecord_` | Custom record types |
+| `EVENT` | — | CRM events |
+| `SCRIPT` | — | Script parameters |
+
+Key columns: `scriptid` (uppercase), `name`, `fieldtype`, `fieldvaluetype`, `ismandatory`, `isshowinlist`, `isstored`, `recordtype` (RECORD fields only), `lastmodifieddate`.
+
+> **Important:** `scriptid` values are stored UPPERCASE in `CustomField` (e.g. `CUSTBODY_CU_MARKETPLACE`), but used lowercase in SuiteQL queries on the actual record table (e.g. `custbody_cu_marketplace`).
+
+**Example — list transaction body fields:**
+```sql
+SELECT scriptid, name, fieldvaluetype, ismandatory, isstored
+FROM CustomField
+WHERE fieldtype = 'BODY' AND isstored = 'T'
+ORDER BY scriptid
+```
+
+**Example — list entity custom fields:**
+```sql
+SELECT scriptid, name, fieldvaluetype, ismandatory, isstored
+FROM CustomField
+WHERE fieldtype = 'ENTITY' AND isstored = 'T'
+ORDER BY scriptid
+```
+
+See `suiteql-query-library.md` for full queries and all fieldtype values.
+
+---
+
 ### `CustomRecordType`
 Metadata about custom record types. Note: uses `internalid`, not `id`.
 

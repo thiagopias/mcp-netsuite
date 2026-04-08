@@ -108,6 +108,26 @@ export class NetSuiteClient {
     return this.accessToken.token;
   }
 
+  /** Parse a NetSuite API error response into a readable message. */
+  private async parseErrorResponse(response: Response): Promise<string> {
+    const text = await response.text();
+    try {
+      const json = JSON.parse(text) as {
+        title?: string;
+        "o:errorDetails"?: Array<{ detail?: string; "o:errorCode"?: string }>;
+      };
+      const details = json["o:errorDetails"];
+      if (Array.isArray(details) && details.length > 0) {
+        const msgs = details.map((d) => d.detail).filter(Boolean);
+        if (msgs.length > 0) return `${msgs.join("; ")}`;
+      }
+      if (json.title) return json.title;
+    } catch {
+      // not JSON — return raw text
+    }
+    return text;
+  }
+
   async runSuiteQL(
     query: string,
     limit: number = 1000,
@@ -127,8 +147,8 @@ export class NetSuiteClient {
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`SuiteQL query failed (${response.status}): ${errorText}`);
+      const detail = await this.parseErrorResponse(response);
+      throw new Error(`SuiteQL query failed (${response.status}): ${detail}`);
     }
 
     return (await response.json()) as SuiteQLResponse;
@@ -170,10 +190,35 @@ export class NetSuiteClient {
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(
-        `Metadata catalog request failed (${response.status}): ${errorText}`
-      );
+      const detail = await this.parseErrorResponse(response);
+      throw new Error(`Metadata catalog request failed (${response.status}): ${detail}`);
+    }
+
+    return await response.json();
+  }
+
+  async getRecord(
+    recordType: string,
+    id: string | number,
+    expandSubResources = false
+  ): Promise<unknown> {
+    const token = await this.authenticate();
+    const params = expandSubResources ? "?expandSubResources=true" : "";
+    const url =
+      `${this.baseUrl}/services/rest/record/v1/${encodeURIComponent(recordType)}` +
+      `/${encodeURIComponent(String(id))}${params}`;
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      const detail = await this.parseErrorResponse(response);
+      throw new Error(`Record fetch failed (${response.status}): ${detail}`);
     }
 
     return await response.json();

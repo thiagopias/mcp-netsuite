@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { NetSuiteClient } from "./netsuite-client.js";
@@ -325,6 +325,62 @@ server.tool(
       const normalizedName = tableName.trim().toLowerCase();
       validateIdentifier(normalizedName, "tableName");
 
+      if (normalizedName.startsWith("customlist_")) {
+        // Custom list: fetch metadata from customlist table + values from the list's own table
+        const metaResult = await client.runSuiteQL(
+          `SELECT internalid, name, scriptid, isordered, isinactive, lastmodifieddate ` +
+            `FROM CustomList WHERE UPPER(scriptid) = '${normalizedName.toUpperCase()}'`,
+          1,
+          0
+        );
+
+        if (metaResult.items.length === 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  `Error: Custom list '${tableName}' not found. ` +
+                  `Use run_suiteql to list available lists: SELECT name, scriptid FROM CustomList WHERE isinactive = 'F' ORDER BY name`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const meta = metaResult.items[0];
+        const valuesResult = await client.runSuiteQL(
+          `SELECT id, name, isinactive FROM ${normalizedName} ORDER BY id`,
+          1000,
+          0
+        );
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  environment: envId,
+                  table: tableName,
+                  type: "customList",
+                  name: meta.name,
+                  scriptId: meta.scriptid,
+                  internalId: meta.internalid,
+                  isOrdered: meta.isordered,
+                  isInactive: meta.isinactive,
+                  lastModified: meta.lastmodifieddate,
+                  totalValues: valuesResult.totalResults,
+                  values: valuesResult.items,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
       if (normalizedName.startsWith("customrecord_")) {
         // Custom record type: use CustomRecordType + CustomField tables
         const typeResult = await client.runSuiteQL(
@@ -505,9 +561,10 @@ server.tool(
       .describe("End date filter in YYYY-MM-DD format"),
     limit: z.number().min(1).max(1000).default(50).describe("Number of rows per page (max 1000)"),
     offset: z.number().min(0).default(0).describe("Row offset for pagination"),
+    fetchAll: z.boolean().default(false).describe("If true, fetches all pages automatically. Use with caution on large result sets."),
     environment: envParam,
   },
-  async ({ scriptInternalId, scriptId, logType, dateFrom, dateTo, limit, offset, environment }) => {
+  async ({ scriptInternalId, scriptId, logType, dateFrom, dateTo, limit, offset, fetchAll, environment }) => {
     try {
       const { client, envId } = getClient(environment);
 
@@ -544,6 +601,28 @@ server.tool(
         `INNER JOIN Script s ON s.id = sn.scripttype ` +
         `${whereClause} ` +
         `ORDER BY sn.date DESC`;
+
+      if (fetchAll) {
+        const result = await client.runSuiteQLAll(query, limit);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  environment: envId,
+                  totalResults: result.totalResults,
+                  pagesFetched: result.pagesFetched,
+                  rowsReturned: result.items.length,
+                  logs: result.items,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
 
       const result = await client.runSuiteQL(query, limit, offset);
       return {
@@ -754,6 +833,18 @@ server.tool(
       .string()
       .optional()
       .describe("Transaction document number as shown in the UI (e.g. 'SO-12345', 'INV-1001'). Case-insensitive match."),
+    status: z
+      .string()
+      .optional()
+      .describe("Filter by status code (e.g. 'SalesOrd:A' for open sales orders). Use run_suiteql on Transaction to discover available status codes."),
+    subsidiary: z
+      .number()
+      .optional()
+      .describe("Internal ID of the subsidiary to filter by."),
+    marketplace: z
+      .number()
+      .optional()
+      .describe("Internal ID from customlist_cu_marketplace to filter by custbody_cu_marketplace (e.g. 1=ebay, 2=Goldin, 8=Instant Offer)."),
     includeLines: z
       .boolean()
       .default(false)
@@ -764,7 +855,7 @@ server.tool(
     offset: z.number().min(0).default(0).describe("Row offset for pagination"),
     environment: envParam,
   },
-  async ({ transactionType, entityId, dateFrom, dateTo, internalId, externalId, tranId, includeLines, limit, offset, environment }) => {
+  async ({ transactionType, entityId, dateFrom, dateTo, internalId, externalId, tranId, status, subsidiary, marketplace, includeLines, limit, offset, environment }) => {
     try {
       const { client, envId } = getClient(environment);
 
@@ -790,6 +881,15 @@ server.tool(
       }
       if (dateTo) {
         conditions.push(`t.trandate <= TO_DATE('${dateTo}', 'YYYY-MM-DD')`);
+      }
+      if (status) {
+        conditions.push(`t.status = '${status.replace(/'/g, "''")}'`);
+      }
+      if (subsidiary !== undefined) {
+        conditions.push(`t.subsidiary = ${subsidiary}`);
+      }
+      if (marketplace !== undefined) {
+        conditions.push(`t.custbody_cu_marketplace = ${marketplace}`);
       }
       const whereClause = `WHERE ${conditions.join(" AND ")}`;
 
@@ -1014,6 +1114,804 @@ server.tool(
           type: "text" as const,
           text: JSON.stringify(
             { defaultEnvironment: defaultEnv, environments: envDetails },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// get_custom_fields
+// ---------------------------------------------------------------------------
+server.tool(
+  "get_custom_fields",
+  "List custom fields from the NetSuite CustomField table, filtered by field type. " +
+    "Use this to discover custom field script IDs, display names, and data types before writing SuiteQL queries. " +
+    "Field types: " +
+    "BODY = transaction body fields (custbody_*) on sales orders, invoices, RMAs, etc.; " +
+    "ENTITY = entity fields (custentity_*) on customer, vendor, employee, contact records; " +
+    "COLUMN = transaction line fields (custcol_*); " +
+    "ITEM = item fields (custitem_*); " +
+    "RECORD = custom record type fields (custrecord_*). " +
+    "Note: scriptid values are stored uppercase in CustomField but used lowercase in SuiteQL queries.",
+  {
+    fieldType: z
+      .enum(["BODY", "ENTITY", "COLUMN", "ITEM", "RECORD"])
+      .describe("The category of custom fields to list."),
+    search: z
+      .string()
+      .optional()
+      .describe("Optional search term — filters by partial match on scriptid or name (case-insensitive)."),
+    includeInactive: z
+      .boolean()
+      .default(false)
+      .describe("If true, includes fields where isstored = 'F' (formula/display-only fields)."),
+    limit: z.number().min(1).max(1000).default(200).describe("Number of rows per page (max 1000, default 200)"),
+    offset: z.number().min(0).default(0).describe("Row offset for pagination"),
+    environment: envParam,
+  },
+  async ({ fieldType, search, includeInactive, limit, offset, environment }) => {
+    try {
+      const { client, envId } = getClient(environment);
+
+      const conditions: string[] = [`fieldtype = '${fieldType}'`];
+      if (!includeInactive) conditions.push(`isstored = 'T'`);
+      if (search) {
+        const s = search.replace(/'/g, "''");
+        conditions.push(`(UPPER(scriptid) LIKE UPPER('%${s}%') OR UPPER(name) LIKE UPPER('%${s}%'))`);
+      }
+
+      const result = await client.runSuiteQL(
+        `SELECT scriptid, name, fieldvaluetype, ismandatory, isshowinlist, isstored, lastmodifieddate ` +
+          `FROM CustomField WHERE ${conditions.join(" AND ")} ORDER BY scriptid`,
+        limit,
+        offset
+      );
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                environment: envId,
+                fieldType,
+                totalResults: result.totalResults,
+                count: result.count,
+                hasMore: result.hasMore,
+                offset: result.offset,
+                note: "scriptid values are stored uppercase here but used lowercase in SuiteQL queries on the actual record table.",
+                fields: result.items,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: "text" as const, text: `Error: ${message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// get_custom_list
+// ---------------------------------------------------------------------------
+server.tool(
+  "get_custom_list",
+  "Fetch a NetSuite custom list definition and all its values in a single call. " +
+    "Provide one of: scriptId (e.g. 'customlist_cu_marketplace'), internalId, or name (partial match). " +
+    "Returns list metadata and the full list of values with their IDs and names. " +
+    "Use the value IDs when filtering SuiteQL queries on List/Record custom fields.",
+  {
+    scriptId: z
+      .string()
+      .optional()
+      .describe("Script ID of the custom list, e.g. 'customlist_cu_marketplace' (case-insensitive)."),
+    internalId: z
+      .number()
+      .optional()
+      .describe("Internal ID of the custom list."),
+    name: z
+      .string()
+      .optional()
+      .describe("Display name of the custom list — partial, case-insensitive match."),
+    environment: envParam,
+  },
+  async ({ scriptId, internalId, name, environment }) => {
+    try {
+      const { client, envId } = getClient(environment);
+
+      if (!scriptId && internalId === undefined && !name) {
+        return {
+          content: [{ type: "text" as const, text: "Error: Provide at least one of: scriptId, internalId, or name." }],
+          isError: true,
+        };
+      }
+
+      const conditions: string[] = [];
+      if (scriptId) conditions.push(`UPPER(scriptid) = '${scriptId.toUpperCase().replace(/'/g, "''")}'`);
+      if (internalId !== undefined) conditions.push(`internalid = ${internalId}`);
+      if (name) conditions.push(`UPPER(name) LIKE UPPER('%${name.replace(/'/g, "''")}%')`);
+
+      const metaResult = await client.runSuiteQL(
+        `SELECT internalid, name, scriptid, isordered, isinactive, lastmodifieddate ` +
+          `FROM CustomList WHERE ${conditions.join(" OR ")} ORDER BY name`,
+        10,
+        0
+      );
+
+      if (metaResult.items.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: `Error: No custom list found matching the provided criteria.` }],
+          isError: true,
+        };
+      }
+
+      const lists = await Promise.all(
+        metaResult.items.map(async (meta) => {
+          const listScriptId = String(meta.scriptid).toLowerCase();
+          try {
+            const valuesResult = await client.runSuiteQL(
+              `SELECT id, name, isinactive FROM ${listScriptId} ORDER BY id`,
+              1000,
+              0
+            );
+            return {
+              internalId: meta.internalid,
+              name: meta.name,
+              scriptId: meta.scriptid,
+              isOrdered: meta.isordered,
+              isInactive: meta.isinactive,
+              lastModified: meta.lastmodifieddate,
+              totalValues: valuesResult.totalResults,
+              values: valuesResult.items,
+            };
+          } catch {
+            return {
+              internalId: meta.internalid,
+              name: meta.name,
+              scriptId: meta.scriptid,
+              isOrdered: meta.isordered,
+              isInactive: meta.isinactive,
+              lastModified: meta.lastmodifieddate,
+              valuesError: "Could not fetch values — list may have no queryable table.",
+            };
+          }
+        })
+      );
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ environment: envId, totalLists: lists.length, lists }, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: "text" as const, text: `Error: ${message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// get_record
+// ---------------------------------------------------------------------------
+server.tool(
+  "get_record",
+  "Fetch a single NetSuite record by type and internal ID using the REST Record API. " +
+    "Returns the full record with all fields including custom fields — richer than SuiteQL projections. " +
+    "Common record types: customer, vendor, employee, invoice, salesorder, purchaseorder, " +
+    "returnauthorization, journalentry, contact, inventoryitem, assemblyitem. " +
+    "For custom record types use 'customrecord_<scriptid>' (e.g. 'customrecord_cu_rma_line'). " +
+    "Set expandSubResources=true to include sublists (lines, addresses, etc.) — use with caution on large records.",
+  {
+    recordType: z
+      .string()
+      .describe("Record type as used in the REST API, e.g. 'customer', 'salesorder', 'returnauthorization'."),
+    internalId: z
+      .number()
+      .describe("Internal ID of the record to fetch."),
+    expandSubResources: z
+      .boolean()
+      .default(false)
+      .describe("If true, expands sublists (line items, addresses, etc.) in the response."),
+    environment: envParam,
+  },
+  async ({ recordType, internalId, expandSubResources, environment }) => {
+    try {
+      const { client, envId } = getClient(environment);
+      const record = await client.getRecord(recordType, internalId, expandSubResources);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ environment: envId, recordType, internalId, record }, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: "text" as const, text: `Error: ${message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// list_file_cabinet
+// ---------------------------------------------------------------------------
+server.tool(
+  "list_file_cabinet",
+  "Browse the NetSuite File Cabinet. Lists folders and files using SuiteQL. " +
+    "Provide folderId to list contents of a specific folder — omit to list root-level folders. " +
+    "Use nameSearch to search for files or folders by name across the entire cabinet (partial, case-insensitive). " +
+    "Returns folders first, then files, each with id, name, type, size, and last modified date. " +
+    "Use the folder id values to drill down into subfolders.",
+  {
+    folderId: z
+      .number()
+      .optional()
+      .describe("Internal ID of the folder to list contents of. Omit to list root-level folders."),
+    nameSearch: z
+      .string()
+      .optional()
+      .describe("Search for files or folders by name — partial, case-insensitive match. Searches across all folders when provided."),
+    showFolders: z
+      .boolean()
+      .default(true)
+      .describe("Include subfolders in results (default true)."),
+    showFiles: z
+      .boolean()
+      .default(true)
+      .describe("Include files in results (default true)."),
+    limit: z.number().min(1).max(1000).default(100).describe("Number of rows per page (max 1000, default 100)"),
+    offset: z.number().min(0).default(0).describe("Row offset for pagination"),
+    environment: envParam,
+  },
+  async ({ folderId, nameSearch, showFolders, showFiles, limit, offset, environment }) => {
+    try {
+      const { client, envId } = getClient(environment);
+
+      const results: Record<string, unknown>[] = [];
+
+      if (showFolders) {
+        const folderConditions: string[] = [];
+        if (nameSearch) {
+          folderConditions.push(`UPPER(f.name) LIKE UPPER('%${nameSearch.replace(/'/g, "''")}%')`);
+        } else {
+          folderConditions.push(folderId !== undefined ? `f.parent = ${folderId}` : `f.parent IS NULL`);
+        }
+        const folderWhere = folderConditions.length > 0 ? `WHERE ${folderConditions.join(" AND ")}` : "";
+
+        const folderResult = await client.runSuiteQL(
+          `SELECT f.id, f.name, f.parent, BUILTIN.DF(f.parent) AS parentName, f.lastmodifieddate ` +
+            `FROM MediaItemFolder f ${folderWhere} ORDER BY f.name`,
+          limit,
+          offset
+        );
+
+        for (const row of folderResult.items) {
+          results.push({ kind: "folder", ...row });
+        }
+      }
+
+      if (showFiles) {
+        const fileConditions: string[] = [];
+        if (nameSearch) {
+          fileConditions.push(`UPPER(fl.name) LIKE UPPER('%${nameSearch.replace(/'/g, "''")}%')`);
+        } else if (folderId !== undefined) {
+          fileConditions.push(`fl.folder = ${folderId}`);
+        }
+        const fileWhere = fileConditions.length > 0 ? `WHERE ${fileConditions.join(" AND ")}` : "";
+
+        const fileResult = await client.runSuiteQL(
+          `SELECT fl.id, fl.name, fl.filetype, fl.filesize, fl.folder, BUILTIN.DF(fl.folder) AS folderName, fl.lastmodifieddate ` +
+            `FROM File fl ${fileWhere} ORDER BY fl.name`,
+          limit,
+          offset
+        );
+
+        for (const row of fileResult.items) {
+          results.push({ kind: "file", ...row });
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                environment: envId,
+                folderId: folderId ?? null,
+                nameSearch: nameSearch ?? null,
+                totalResults: results.length,
+                items: results,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: "text" as const, text: `Error: ${message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Prompts
+// ---------------------------------------------------------------------------
+server.prompt(
+  "diagnose_script_error",
+  "Investigate NetSuite script errors for a given script and date range. Pulls error logs, identifies recurring patterns, and suggests root causes.",
+  {
+    scriptId: z.string().describe("Script ID string (e.g. 'customscript_cu_sl_get_certificates_ui') or numeric internal ID."),
+    dateFrom: z.string().optional().describe("Start date in YYYY-MM-DD format. Defaults to today."),
+    dateTo: z.string().optional().describe("End date in YYYY-MM-DD format. Defaults to today."),
+    environment: z.enum(["sb1", "sb2"]).optional().describe(`NetSuite environment. Defaults to "${defaultEnv}".`),
+  },
+  ({ scriptId, dateFrom, dateTo, environment }) => {
+    const env = environment ?? defaultEnv;
+    const from = dateFrom ?? new Date().toISOString().slice(0, 10);
+    const to = dateTo ?? new Date().toISOString().slice(0, 10);
+    return {
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text:
+              `Diagnose NetSuite script errors for script "${scriptId}" ` +
+              `from ${from} to ${to} in environment ${env}.\n\n` +
+              `Follow these steps:\n` +
+              `1. Call get_script_logs with scriptId="${scriptId}", logType="ERROR", dateFrom="${from}", dateTo="${to}", limit=100, environment="${env}"\n` +
+              `2. Call get_script_logs again with logType="EMERGENCY" for the same parameters\n` +
+              `3. Group all errors by their "title" field to identify recurring patterns\n` +
+              `4. For each distinct error pattern, note: the title, count of occurrences, first and last seen timestamp, and a sample "detail" value\n` +
+              `5. Examine the "detail" fields for stack traces, record IDs, or data clues\n` +
+              `6. Present a summary with:\n` +
+              `   - Total error count\n` +
+              `   - Top error patterns ranked by frequency\n` +
+              `   - Most likely root cause for each pattern\n` +
+              `   - Suggested remediation steps`,
+          },
+        },
+      ],
+    };
+  }
+);
+
+server.prompt(
+  "explain_transaction",
+  "Fetch and explain a NetSuite transaction in full: header, line items, and audit trail.",
+  {
+    tranId: z.string().describe("Transaction document number as shown in the UI, e.g. 'SO-12345' or 'CD15763'."),
+    environment: z.enum(["sb1", "sb2"]).optional().describe(`NetSuite environment. Defaults to "${defaultEnv}".`),
+  },
+  ({ tranId, environment }) => {
+    const env = environment ?? defaultEnv;
+    return {
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text:
+              `Explain the NetSuite transaction "${tranId}" in environment ${env}.\n\n` +
+              `Follow these steps:\n` +
+              `1. Call get_transactions with tranId="${tranId}", includeLines=true, environment="${env}" to get the full transaction with line items\n` +
+              `2. Note the transaction's internal ID from the result (field "id")\n` +
+              `3. Call get_system_notes with recordId=<internal ID from step 2>, environment="${env}" to get the field-change audit trail\n` +
+              `4. Present a structured explanation:\n` +
+              `   **Header**: type, status, entity name, date, amount, currency, memo, marketplace (if set)\n` +
+              `   **Line items**: for each line — item name, quantity, rate, amount, description\n` +
+              `   **Audit trail**: chronological timeline of changes — date, changed by, context (UI/Script), field, old value → new value\n` +
+              `5. Highlight anything notable: voided lines, status changes driven by scripts, large amounts, missing fields`,
+          },
+        },
+      ],
+    };
+  }
+);
+
+server.prompt(
+  "audit_record_changes",
+  "Show the complete field-change history for any NetSuite record as a readable timeline.",
+  {
+    recordId: z.number().describe("Internal ID of the record to audit."),
+    recordTypeId: z.number().optional().describe("Internal ID of the record type (e.g. -30 for transactions, -2 for customers). Optional but improves query performance."),
+    dateFrom: z.string().optional().describe("Start date in YYYY-MM-DD format."),
+    dateTo: z.string().optional().describe("End date in YYYY-MM-DD format."),
+    environment: z.enum(["sb1", "sb2"]).optional().describe(`NetSuite environment. Defaults to "${defaultEnv}".`),
+  },
+  ({ recordId, recordTypeId, dateFrom, dateTo, environment }) => {
+    const env = environment ?? defaultEnv;
+    const dateRange = dateFrom || dateTo
+      ? ` between ${dateFrom ?? "the beginning"} and ${dateTo ?? "now"}`
+      : "";
+    return {
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text:
+              `Audit all field changes for record ID ${recordId}` +
+              (recordTypeId !== undefined ? ` (record type ID ${recordTypeId})` : "") +
+              `${dateRange} in environment ${env}.\n\n` +
+              `Follow these steps:\n` +
+              `1. Call get_system_notes with:\n` +
+              `   - recordId=${recordId}\n` +
+              (recordTypeId !== undefined ? `   - recordTypeId=${recordTypeId}\n` : "") +
+              (dateFrom ? `   - dateFrom="${dateFrom}"\n` : "") +
+              (dateTo ? `   - dateTo="${dateTo}"\n` : "") +
+              `   - limit=200, environment="${env}"\n` +
+              `2. If hasMore=true, paginate to retrieve all changes\n` +
+              `3. Present a chronological timeline:\n` +
+              `   | Date | Changed By | Context | Field | Old Value → New Value |\n` +
+              `4. Group or annotate by context type:\n` +
+              `   - UIF = user edited manually in the UI\n` +
+              `   - RST/SCH/SLT/UES = script-driven change (note the script context)\n` +
+              `   - CSV = bulk import\n` +
+              `5. Summarize: total changes, most frequently changed fields, who/what made the most changes`,
+          },
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Resource: netsuite://environments
+// ---------------------------------------------------------------------------
+server.resource(
+  "environments",
+  "netsuite://environments",
+  {
+    description: "Lists all configured NetSuite environments, their account IDs, and which is the default.",
+    mimeType: "application/json",
+  },
+  async (uri) => {
+    const envDetails = availableEnvs.map((envId) => ({
+      id: envId,
+      accountId: process.env[`NETSUITE_${envId.toUpperCase()}_ACCOUNT_ID`],
+      isDefault: envId === defaultEnv,
+    }));
+    return {
+      contents: [
+        {
+          uri: uri.toString(),
+          mimeType: "application/json",
+          text: JSON.stringify({ defaultEnvironment: defaultEnv, environments: envDetails }, null, 2),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Resource: netsuite://schema/transaction
+// ---------------------------------------------------------------------------
+const TRANSACTION_SCHEMA = `# NetSuite Transaction Schema
+
+All transaction types share the \`Transaction\` table, differentiated by \`type\`.
+
+## Transaction type codes
+| Code | Type |
+|------|------|
+| SalesOrd | Sales Order |
+| CustInvc | Invoice |
+| CustDep | Customer Deposit |
+| CustPymt | Customer Payment |
+| CashSale | Cash Sale |
+| CustCred | Credit Memo |
+| CustRfnd | Customer Refund |
+| PurchOrd | Purchase Order |
+| VendBill | Vendor Bill |
+| ItemRcpt | Item Receipt |
+| RtnAuth | Return Authorization |
+| Journal | Journal Entry |
+| TrnfrOrd | Transfer Order |
+
+## Transaction table — key fields
+| Field | Notes |
+|-------|-------|
+| id | Internal ID |
+| type | Type code (see above) |
+| tranid | Document number shown in UI (e.g. SO-12345) |
+| transactionnumber | Full transaction number (e.g. CUSTDEP15763) |
+| entity | Customer/vendor internal ID |
+| trandate | Transaction date |
+| status | Status code — use BUILTIN.DF(status) for label |
+| amount | Transaction amount |
+| foreigntotal | Amount in transaction currency |
+| foreignamountunpaid | Unpaid balance in transaction currency |
+| currency | Currency internal ID |
+| memo | Memo field |
+| createdate | Created date |
+| createdby | Created by (employee internal ID) |
+| lastmodifieddate | Last modified date |
+| postingperiod | Accounting period internal ID |
+| voided | T/F — always filter voided = 'F' |
+| posting | T/F |
+| duedate | Due date |
+| closedate | Close date |
+| otherrefnum | External reference (e.g. PO number, Stripe charge ID) |
+| externalid | External system ID |
+| custbody_cu_marketplace | Custom: marketplace (List/Record → customlist_cu_marketplace) |
+| custbody_cu_originating_ctpr | Custom: originating counterpart internal ID |
+| customform | Custom form internal ID |
+| paymentmethod | Payment method internal ID |
+| exchangerate | Exchange rate |
+| subsidiary | Subsidiary internal ID |
+| department | Department internal ID |
+| class | Class/LOB internal ID |
+| location | Location internal ID |
+| employee | Sales rep internal ID |
+| terms | Payment terms internal ID |
+
+## TransactionLine table — key fields
+Join: \`TransactionLine.transaction = Transaction.id\`
+
+| Field | Notes |
+|-------|-------|
+| id | Line internal ID |
+| transaction | Parent transaction internal ID |
+| linesequencenumber | Line order/position |
+| item | Item internal ID |
+| itemtype | Item type (TaxItem, InvtPart, Service, etc.) |
+| quantity | Quantity |
+| rate | Unit rate |
+| amount | Line amount |
+| foreignamount | Amount in foreign currency |
+| description | Line description / memo |
+| mainline | T for header line, F for item lines — filter mainline = 'F' for items |
+| class | Class/LOB internal ID |
+| department | Department internal ID |
+| location | Location internal ID |
+| subsidiary | Subsidiary internal ID |
+| taxamount | Tax amount |
+| taxline | T if this is a tax line |
+| isclosed | T/F |
+| memo | Line memo |
+
+## TransactionAccountingLine table — GL impact
+Join: \`TransactionAccountingLine.transaction = Transaction.id\`
+
+| Field | Notes |
+|-------|-------|
+| account | GL account internal ID |
+| debit | Debit amount |
+| credit | Credit amount |
+| posting | T/F |
+| transactionline | TransactionLine.id reference |
+
+## Common queries
+
+\`\`\`sql
+-- Header + lines
+SELECT t.tranid, tl.item, tl.quantity, tl.amount
+FROM Transaction t
+INNER JOIN TransactionLine tl ON tl.transaction = t.id
+WHERE t.type = 'SalesOrd' AND t.voided = 'F' AND tl.mainline = 'F'
+ORDER BY t.trandate DESC
+
+-- GL impact for a transaction
+SELECT BUILTIN.DF(tal.account) AS account, tal.debit, tal.credit
+FROM TransactionAccountingLine tal
+WHERE tal.transaction = <id>
+  AND (tal.debit IS NOT NULL OR tal.credit IS NOT NULL)
+ORDER BY tal.transactionline
+\`\`\`
+`;
+
+server.resource(
+  "schema-transaction",
+  "netsuite://schema/transaction",
+  {
+    description: "Field reference for the NetSuite Transaction and TransactionLine tables. Use before writing SuiteQL queries against transactions.",
+    mimeType: "text/markdown",
+  },
+  async (uri) => ({
+    contents: [{ uri: uri.toString(), mimeType: "text/markdown", text: TRANSACTION_SCHEMA }],
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Resource template: netsuite://custom-fields/{fieldType}
+// ---------------------------------------------------------------------------
+const CUSTOM_FIELD_TYPES: Record<string, string> = {
+  BODY: "Transaction Body Fields (custbody_*) — header-level fields on sales orders, invoices, RMAs, etc.",
+  ENTITY: "Entity Fields (custentity_*) — fields on customer, vendor, employee, and contact records.",
+  COLUMN: "Transaction Line Fields (custcol_*) — fields on transaction line items.",
+  ITEM: "Item Fields (custitem_*) — fields on inventory items, service items, etc.",
+  RECORD: "Custom Record Fields (custrecord_*) — fields belonging to custom record types.",
+};
+
+server.resource(
+  "custom-fields",
+  new ResourceTemplate("netsuite://custom-fields/{fieldType}", {
+    list: async () => ({
+      resources: Object.entries(CUSTOM_FIELD_TYPES).map(([fieldType, description]) => ({
+        uri: `netsuite://custom-fields/${fieldType}`,
+        name: `Custom Fields: ${fieldType}`,
+        description,
+        mimeType: "application/json",
+      })),
+    }),
+  }),
+  {
+    description: "Live catalog of custom fields by type from the NetSuite CustomField table. fieldType: BODY, ENTITY, COLUMN, ITEM, RECORD.",
+    mimeType: "application/json",
+  },
+  async (uri, variables) => {
+    const fieldType = (variables.fieldType as string).toUpperCase();
+    if (!CUSTOM_FIELD_TYPES[fieldType]) {
+      return {
+        contents: [
+          {
+            uri: uri.toString(),
+            mimeType: "application/json",
+            text: JSON.stringify({
+              error: `Unknown fieldType '${fieldType}'. Valid values: ${Object.keys(CUSTOM_FIELD_TYPES).join(", ")}`,
+            }),
+          },
+        ],
+      };
+    }
+
+    const { client } = getClient();
+    const result = await client.runSuiteQL(
+      `SELECT scriptid, name, fieldvaluetype, ismandatory, isshowinlist, isstored, lastmodifieddate ` +
+        `FROM CustomField WHERE fieldtype = '${fieldType}' AND isstored = 'T' ORDER BY scriptid`,
+      1000,
+      0
+    );
+
+    return {
+      contents: [
+        {
+          uri: uri.toString(),
+          mimeType: "application/json",
+          text: JSON.stringify(
+            {
+              fieldType,
+              description: CUSTOM_FIELD_TYPES[fieldType],
+              totalFields: result.totalResults,
+              fields: result.items,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Resource: netsuite://custom-lists
+// ---------------------------------------------------------------------------
+server.resource(
+  "custom-lists",
+  "netsuite://custom-lists",
+  {
+    description: "Live catalog of all active custom lists in NetSuite. Use the scriptId to query list values via netsuite://custom-list/{scriptId}.",
+    mimeType: "application/json",
+  },
+  async (uri) => {
+    const { client, envId } = getClient();
+    const result = await client.runSuiteQL(
+      `SELECT internalid, name, scriptid, isordered, lastmodifieddate ` +
+        `FROM CustomList WHERE isinactive = 'F' ORDER BY name`,
+      1000,
+      0
+    );
+    return {
+      contents: [
+        {
+          uri: uri.toString(),
+          mimeType: "application/json",
+          text: JSON.stringify(
+            {
+              environment: envId,
+              totalLists: result.totalResults,
+              lists: result.items,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Resource template: netsuite://custom-list/{scriptId}
+// ---------------------------------------------------------------------------
+server.resource(
+  "custom-list-values",
+  new ResourceTemplate("netsuite://custom-list/{scriptId}", {
+    list: undefined, // enumeration not practical — use netsuite://custom-lists to discover
+  }),
+  {
+    description: "Values for a specific custom list. scriptId should be the lowercase list script ID, e.g. 'customlist_cu_marketplace'.",
+    mimeType: "application/json",
+  },
+  async (uri, variables) => {
+    const scriptId = (variables.scriptId as string).toLowerCase();
+    validateIdentifier(scriptId, "scriptId");
+
+    const { client, envId } = getClient();
+
+    // Look up metadata from customlist table (scriptid stored uppercase)
+    const metaResult = await client.runSuiteQL(
+      `SELECT internalid, name, scriptid, isordered, isinactive, lastmodifieddate ` +
+        `FROM CustomList WHERE UPPER(scriptid) = '${scriptId.toUpperCase()}'`,
+      1,
+      0
+    );
+
+    if (metaResult.items.length === 0) {
+      return {
+        contents: [
+          {
+            uri: uri.toString(),
+            mimeType: "application/json",
+            text: JSON.stringify({ error: `Custom list '${scriptId}' not found.` }),
+          },
+        ],
+      };
+    }
+
+    const meta = metaResult.items[0];
+
+    // Query the list's values table directly
+    const valuesResult = await client.runSuiteQL(
+      `SELECT id, name, isinactive FROM ${scriptId} ORDER BY id`,
+      1000,
+      0
+    );
+
+    return {
+      contents: [
+        {
+          uri: uri.toString(),
+          mimeType: "application/json",
+          text: JSON.stringify(
+            {
+              environment: envId,
+              scriptId,
+              name: meta.name,
+              internalId: meta.internalid,
+              isOrdered: meta.isordered,
+              lastModified: meta.lastmodifieddate,
+              totalValues: valuesResult.totalResults,
+              values: valuesResult.items,
+            },
             null,
             2
           ),
