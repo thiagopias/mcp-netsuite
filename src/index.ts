@@ -4,6 +4,10 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mc
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { NetSuiteClient } from "./netsuite-client.js";
+import { spawn } from "child_process";
+import { mkdtemp, mkdir, writeFile, rm, copyFile } from "fs/promises";
+import { tmpdir } from "os";
+import path from "path";
 
 type EnvId = "sb1" | "sb2";
 
@@ -79,6 +83,37 @@ const envParam = z
     `Target NetSuite environment (available: ${availableEnvs.join(", ")}). ` +
       `Defaults to "${defaultEnv}".`
   );
+
+/** Run `suitecloud file:upload --paths <filePath>` from a project directory. */
+function runSuiteCloudUpload(projectDir: string, filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("suitecloud", ["file:upload", "--paths", filePath], {
+      cwd: projectDir,
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+
+    proc.on("close", (code: number | null) => {
+      const combined = [stdout, stderr].filter(Boolean).join("\n").trim();
+      if (code === 0) {
+        resolve(combined || "Upload completed successfully.");
+      } else {
+        reject(new Error(`suitecloud file:upload exited with code ${code}: ${combined}`));
+      }
+    });
+
+    proc.on("error", (err: Error) => {
+      reject(new Error(
+        `Failed to launch suitecloud CLI: ${err.message}. ` +
+        "Ensure @oracle/suitecloud-cli is installed globally: npm install -g @oracle/suitecloud-cli"
+      ));
+    });
+  });
+}
 
 const server = new McpServer({
   name: "mcp-netsuite-logs",
@@ -1449,6 +1484,120 @@ server.tool(
           },
         ],
       };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: "text" as const, text: `Error: ${message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// upload_file
+// ---------------------------------------------------------------------------
+server.tool(
+  "upload_file",
+  "Upload a local file to the NetSuite File Cabinet using the SuiteCloud CLI. " +
+    "Requires the SuiteCloud CLI installed globally (`npm install -g @oracle/suitecloud-cli`) " +
+    "and an auth ID registered via `suitecloud account:setup`. " +
+    "Set NETSUITE_SB1_SUITECLOUD_AUTH_ID and/or NETSUITE_SB2_SUITECLOUD_AUTH_ID environment variables " +
+    "to avoid passing authId on every call. " +
+    "Valid destination path prefixes: /SuiteScripts/, /Templates/, /Web Site Hosting Files/, /SuiteApps/. " +
+    "Example: upload /Users/me/work/myScript.js to /SuiteScripts/custom/myScript.js",
+  {
+    localFilePath: z
+      .string()
+      .describe("Absolute path to the local file to upload, e.g. '/Users/me/work/myScript.js'"),
+    destinationPath: z
+      .string()
+      .describe(
+        "NetSuite File Cabinet destination path. Must start with /SuiteScripts/, /Templates/, " +
+        "/Web Site Hosting Files/, or /SuiteApps/. Example: '/SuiteScripts/custom/myScript.js'"
+      ),
+    authId: z
+      .string()
+      .optional()
+      .describe(
+        "SuiteCloud CLI auth ID for the target account (created via `suitecloud account:setup`). " +
+        "Falls back to NETSUITE_<ENV>_SUITECLOUD_AUTH_ID env var when omitted."
+      ),
+    environment: envParam,
+  },
+  async ({ localFilePath, destinationPath, authId, environment }) => {
+    try {
+      const { envId } = getClient(environment);
+
+      const resolvedAuthId =
+        authId ?? process.env[`NETSUITE_${envId.toUpperCase()}_SUITECLOUD_AUTH_ID`];
+
+      if (!resolvedAuthId) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `Error: No SuiteCloud auth ID for environment "${envId}". ` +
+                `Pass authId directly or set NETSUITE_${envId.toUpperCase()}_SUITECLOUD_AUTH_ID. ` +
+                `Run 'suitecloud account:setup' to create one.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const validPrefixes = ["/SuiteScripts/", "/Templates/", "/Web Site Hosting Files/", "/SuiteApps/"];
+      if (!validPrefixes.some((p) => destinationPath.startsWith(p))) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `Error: Invalid destination path "${destinationPath}". ` +
+                `Must start with one of: ${validPrefixes.join(", ")}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const tmpDir = await mkdtemp(path.join(tmpdir(), "suitecloud-upload-"));
+
+      try {
+        // Minimal ACP project.json required by the SuiteCloud CLI
+        await writeFile(
+          path.join(tmpDir, "project.json"),
+          JSON.stringify(
+            { defaultAuthId: resolvedAuthId, projectType: "ACP", projectVersion: "1.0.0", projectName: "mcp-upload" },
+            null,
+            2
+          )
+        );
+
+        // Mirror the File Cabinet structure inside the temp project dir
+        const relPath = destinationPath.startsWith("/") ? destinationPath.slice(1) : destinationPath;
+        const destInProject = path.join(tmpDir, "FileCabinet", relPath);
+        await mkdir(path.dirname(destInProject), { recursive: true });
+        await copyFile(localFilePath, destInProject);
+
+        const output = await runSuiteCloudUpload(tmpDir, destinationPath);
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                { environment: envId, authId: resolvedAuthId, localFilePath, destinationPath, output },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } finally {
+        await rm(tmpDir, { recursive: true, force: true });
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return {
