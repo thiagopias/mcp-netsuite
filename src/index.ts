@@ -9,7 +9,7 @@ import { mkdtemp, mkdir, writeFile, rm, copyFile } from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
 
-type EnvId = "sb1" | "sb2";
+type EnvId = "sb1" | "sb2" | "prod";
 
 interface EnvConfig {
   accountId: string;
@@ -39,7 +39,7 @@ function loadEnvConfig(prefix: string): EnvConfig | null {
 const clients = new Map<EnvId, NetSuiteClient>();
 const availableEnvs: EnvId[] = [];
 
-for (const envId of ["sb1", "sb2"] as const) {
+for (const envId of ["sb1", "sb2", "prod"] as const) {
   const cfg = loadEnvConfig(envId.toUpperCase());
   if (cfg) {
     clients.set(envId, new NetSuiteClient(cfg));
@@ -77,7 +77,7 @@ function validateIdentifier(name: string, label: string): void {
 }
 
 const envParam = z
-  .enum(["sb1", "sb2"])
+  .enum(["sb1", "sb2", "prod"])
   .optional()
   .describe(
     `Target NetSuite environment (available: ${availableEnvs.join(", ")}). ` +
@@ -1388,6 +1388,132 @@ server.tool(
 );
 
 // ---------------------------------------------------------------------------
+// create_customer
+// ---------------------------------------------------------------------------
+server.tool(
+  "create_customer",
+  "Create a new customer record in NetSuite via the REST Record API (POST /record/v1/customer). " +
+    "For company customers, leave isPerson=false (default) and provide companyName. " +
+    "For individual customers, set isPerson=true and provide firstName and lastName. " +
+    "subsidiaryId is required on NetSuite OneWorld accounts. " +
+    "entityId is the customer's unique identifier string — usually auto-numbered, so omit unless you need a specific value. " +
+    "Set externalId to enable idempotent upserts keyed on your system's ID. " +
+    "Use additionalFields to pass any other fields, addressbook lines, or custom fields documented " +
+    "in get_record_metadata('customer'). On success returns the new internal ID extracted from the Location header.",
+  {
+    isPerson: z
+      .boolean()
+      .default(false)
+      .describe("true for an individual customer; false (default) for a company."),
+    companyName: z
+      .string()
+      .optional()
+      .describe("Company name. Required when isPerson is false."),
+    firstName: z
+      .string()
+      .optional()
+      .describe("First name. Required when isPerson is true."),
+    lastName: z
+      .string()
+      .optional()
+      .describe("Last name. Required when isPerson is true."),
+    middleName: z
+      .string()
+      .optional()
+      .describe("Middle name (person customers only)."),
+    email: z.string().optional().describe("Primary email address."),
+    phone: z.string().optional().describe("Primary phone number."),
+    entityId: z
+      .string()
+      .optional()
+      .describe(
+        "Customer identifier string (e.g. 'C12345'). Usually auto-generated — omit unless your account requires manual entry."
+      ),
+    externalId: z
+      .string()
+      .optional()
+      .describe("External system ID — set to enable idempotent create/update by external key."),
+    subsidiaryId: z
+      .union([z.number(), z.string()])
+      .optional()
+      .describe("Internal ID of the subsidiary. Required on OneWorld accounts."),
+    additionalFields: z
+      .record(z.unknown())
+      .optional()
+      .describe(
+        "Extra fields/sublists merged into the request body, e.g. " +
+          "{ \"category\": { \"id\": \"5\" }, \"addressbook\": { \"items\": [...] }, \"custentity_xyz\": \"abc\" }."
+      ),
+    environment: envParam,
+  },
+  async ({
+    isPerson,
+    companyName,
+    firstName,
+    lastName,
+    middleName,
+    email,
+    phone,
+    entityId,
+    externalId,
+    subsidiaryId,
+    additionalFields,
+    environment,
+  }) => {
+    try {
+      if (isPerson) {
+        if (!firstName || !lastName) {
+          throw new Error("firstName and lastName are required when isPerson is true.");
+        }
+      } else if (!companyName) {
+        throw new Error("companyName is required when isPerson is false.");
+      }
+
+      const body: Record<string, unknown> = { isPerson };
+      if (companyName !== undefined) body.companyName = companyName;
+      if (firstName !== undefined) body.firstName = firstName;
+      if (lastName !== undefined) body.lastName = lastName;
+      if (middleName !== undefined) body.middleName = middleName;
+      if (email !== undefined) body.email = email;
+      if (phone !== undefined) body.phone = phone;
+      if (entityId !== undefined) body.entityId = entityId;
+      if (externalId !== undefined) body.externalId = externalId;
+      if (subsidiaryId !== undefined) body.subsidiary = { id: String(subsidiaryId) };
+      if (additionalFields) Object.assign(body, additionalFields);
+
+      const { client, envId } = getClient(environment);
+      const result = await client.createRecord("customer", body);
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                environment: envId,
+                created: true,
+                internalId: result.id,
+                location: result.location,
+                status: result.status,
+                requestBody: body,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: "text" as const, text: `Error: ${message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
 // list_file_cabinet
 // ---------------------------------------------------------------------------
 server.tool(
@@ -1618,7 +1744,7 @@ server.prompt(
     scriptId: z.string().describe("Script ID string (e.g. 'customscript_cu_sl_get_certificates_ui') or numeric internal ID."),
     dateFrom: z.string().optional().describe("Start date in YYYY-MM-DD format. Defaults to today."),
     dateTo: z.string().optional().describe("End date in YYYY-MM-DD format. Defaults to today."),
-    environment: z.enum(["sb1", "sb2"]).optional().describe(`NetSuite environment. Defaults to "${defaultEnv}".`),
+    environment: z.enum(["sb1", "sb2", "prod"]).optional().describe(`NetSuite environment. Defaults to "${defaultEnv}".`),
   },
   ({ scriptId, dateFrom, dateTo, environment }) => {
     const env = environment ?? defaultEnv;
@@ -1656,7 +1782,7 @@ server.prompt(
   "Fetch and explain a NetSuite transaction in full: header, line items, and audit trail.",
   {
     tranId: z.string().describe("Transaction document number as shown in the UI, e.g. 'SO-12345' or 'CD15763'."),
-    environment: z.enum(["sb1", "sb2"]).optional().describe(`NetSuite environment. Defaults to "${defaultEnv}".`),
+    environment: z.enum(["sb1", "sb2", "prod"]).optional().describe(`NetSuite environment. Defaults to "${defaultEnv}".`),
   },
   ({ tranId, environment }) => {
     const env = environment ?? defaultEnv;
@@ -1692,7 +1818,7 @@ server.prompt(
     recordTypeId: z.number().optional().describe("Internal ID of the record type (e.g. -30 for transactions, -2 for customers). Optional but improves query performance."),
     dateFrom: z.string().optional().describe("Start date in YYYY-MM-DD format."),
     dateTo: z.string().optional().describe("End date in YYYY-MM-DD format."),
-    environment: z.enum(["sb1", "sb2"]).optional().describe(`NetSuite environment. Defaults to "${defaultEnv}".`),
+    environment: z.enum(["sb1", "sb2", "prod"]).optional().describe(`NetSuite environment. Defaults to "${defaultEnv}".`),
   },
   ({ recordId, recordTypeId, dateFrom, dateTo, environment }) => {
     const env = environment ?? defaultEnv;

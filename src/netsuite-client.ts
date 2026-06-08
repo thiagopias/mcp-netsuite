@@ -224,6 +224,37 @@ export class NetSuiteClient {
     return await response.json();
   }
 
+  async createRecord(
+    recordType: string,
+    body: Record<string, unknown>
+  ): Promise<{ id: string | null; location: string | null; status: number }> {
+    const token = await this.authenticate();
+    const url = `${this.baseUrl}/services/rest/record/v1/${encodeURIComponent(recordType)}`;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const detail = await this.parseErrorResponse(response);
+      throw new Error(`Record create failed (${response.status}): ${detail}`);
+    }
+
+    const location = response.headers.get("location");
+    let id: string | null = null;
+    if (location) {
+      const match = location.match(/\/([^/]+)\/?$/);
+      if (match) id = match[1];
+    }
+    return { id, location, status: response.status };
+  }
+
   async callRestlet(
     scriptId: string,
     deployId: string,

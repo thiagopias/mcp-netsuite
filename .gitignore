@@ -8,3 +8,4 @@ dist/
 .cursor/mcp.json
 secrets/
 .claude.json
+env

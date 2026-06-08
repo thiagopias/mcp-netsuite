@@ -14,6 +14,7 @@ Supports multiple environments (e.g. sandbox + production) with a configurable d
 | `describe_netsuite_table` | Show columns for a table — uses OA_COLUMNS for standard tables, CustomField for custom records |
 | `get_custom_record_types` | List all custom record types with their scriptId, internalId, name, and status |
 | `get_record_metadata` | Get full OpenAPI/JSON Schema field definitions for a standard record type |
+| `create_customer` | Create a new customer record (company or person) via the REST Record API |
 | `get_script_catalog` | List all deployed SuiteScripts with script type, ID, file, and deployment status |
 | `get_script_logs` | Query script execution logs (the `scriptnote` table) by script, log level, and date |
 | `get_transactions` | Query transactions with optional line items — supports filtering by type, entity, date, tranId, and more |
