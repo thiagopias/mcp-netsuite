@@ -255,6 +255,39 @@ export class NetSuiteClient {
     return { id, location, status: response.status };
   }
 
+  async updateRecord(
+    recordType: string,
+    id: string | number,
+    body: Record<string, unknown>,
+    options: { method?: "PATCH" | "PUT"; replaceSubLists?: string[] } = {}
+  ): Promise<{ status: number }> {
+    const token = await this.authenticate();
+    const { method = "PATCH", replaceSubLists } = options;
+
+    let url =
+      `${this.baseUrl}/services/rest/record/v1/${encodeURIComponent(recordType)}` +
+      `/${encodeURIComponent(String(id))}`;
+    if (replaceSubLists && replaceSubLists.length > 0) {
+      url += `?replace=${replaceSubLists.map(encodeURIComponent).join(",")}`;
+    }
+
+    const response = await fetch(url, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const detail = await this.parseErrorResponse(response);
+      throw new Error(`Record update failed (${response.status}): ${detail}`);
+    }
+
+    return { status: response.status };
+  }
+
   async callRestlet(
     scriptId: string,
     deployId: string,

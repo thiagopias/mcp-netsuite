@@ -1514,6 +1514,86 @@ server.tool(
 );
 
 // ---------------------------------------------------------------------------
+// update_record
+// ---------------------------------------------------------------------------
+server.tool(
+  "update_record",
+  "Update an existing NetSuite record via the REST Record API. " +
+    "Uses PATCH by default (partial update — only the fields you send are changed). " +
+    "Pass method='PUT' to fully replace the record. " +
+    "Identify the record by its numeric internalId, or prefix an external ID with 'eid:' (e.g. 'eid:MY_KEY'). " +
+    "For sublists (addressbook, lines, etc.), PATCH replaces the entire sublist by default. " +
+    "Use replaceSubLists to explicitly name which sublists should be replaced; unlisted sublists are left untouched. " +
+    "Returns the HTTP status code (204 = success, no body returned by NetSuite). " +
+    "Use get_record_metadata(recordType) to discover available fields before updating.",
+  {
+    recordType: z
+      .string()
+      .describe(
+        "Record type in camelCase as used by the REST API, e.g. 'customer', 'salesOrder', 'vendorBill', 'contact'."
+      ),
+    id: z
+      .union([z.number(), z.string()])
+      .describe(
+        "Internal ID (numeric) or external ID prefixed with 'eid:' (e.g. 'eid:MY_EXTERNAL_KEY')."
+      ),
+    fields: z
+      .record(z.unknown())
+      .describe(
+        "Fields to update, e.g. { \"email\": \"new@example.com\", \"phone\": \"555-1234\", " +
+          "\"subsidiary\": { \"id\": \"3\" }, \"custentity_xyz\": \"value\" }."
+      ),
+    replaceSubLists: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Sublist names that should be fully replaced with the values you provide (e.g. ['addressbook', 'currency']). " +
+          "Omit to replace all provided sublists (default PATCH behavior)."
+      ),
+    method: z
+      .enum(["PATCH", "PUT"])
+      .default("PATCH")
+      .describe("HTTP method: PATCH for partial update (default), PUT for full replacement."),
+    environment: envParam,
+  },
+  async ({ recordType, id, fields, replaceSubLists, method, environment }) => {
+    try {
+      const { client, envId } = getClient(environment);
+      const result = await client.updateRecord(recordType, id, fields, {
+        method,
+        replaceSubLists,
+      });
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                environment: envId,
+                updated: true,
+                recordType,
+                id,
+                httpStatus: result.status,
+                method,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: "text" as const, text: `Error: ${message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
 // list_file_cabinet
 // ---------------------------------------------------------------------------
 server.tool(
